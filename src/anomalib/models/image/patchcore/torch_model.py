@@ -5,7 +5,7 @@
 
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
-
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F  # noqa: N812
@@ -55,6 +55,8 @@ class PatchcoreModel(DynamicBufferMixin, nn.Module):
 
         self.register_buffer("memory_bank", torch.Tensor())
         self.memory_bank: torch.Tensor
+        
+        self.save_counter = 1  # カウンタを初期化
 
     def forward(self, input_tensor: torch.Tensor) -> torch.Tensor | dict[str, torch.Tensor]:
         """Return Embedding during training, or a tuple of anomaly map and anomaly score during testing.
@@ -70,27 +72,40 @@ class PatchcoreModel(DynamicBufferMixin, nn.Module):
         Returns:
             Tensor | dict[str, torch.Tensor]: Embedding for training, anomaly map and anomaly score for testing.
         """
+        #input_tensor shape: torch.Size([26, 3, 896, 896]
         output_size = input_tensor.shape[-2:]
         if self.tiler:
             input_tensor = self.tiler.tile(input_tensor)
-
+        #tiled input_tensor shape:torch.Size([26, 3, 896, 896]
         with torch.no_grad():
             features = self.feature_extractor(input_tensor)
 
         features = {layer: self.feature_pooler(feature) for layer, feature in features.items()}
         embedding = self.generate_embedding(features)
+        #embedding shape: torch.Size([26, 3, 112, 112]
 
         if self.tiler:
             embedding = self.tiler.untile(embedding)
 
         batch_size, _, width, height = embedding.shape
+        #untiled embedding shape:torch.Size([26, 1536, 112, 112]
         embedding = self.reshape_embedding(embedding)
+        #reshaped embedding shape: torch.Size([326144, 1536])
 
         if self.training:
             output = embedding
         else:
             # apply nearest neighbor search
             patch_scores, locations = self.nearest_neighbors(embedding=embedding, n_neighbors=1)
+            #locations, patch_scores shape:  torch.Size([326144])
+            #locations: tensor([  94,   94, 2014,  ..., 2268, 2788, 2788], device='cuda:0')
+            #self.memory_bank shape: torch.Size([3763, 1536])
+            #self.memory_bank:  [0.0000, 0.0000, 4.5268,  ..., 0.4485, 0.0000, 8.3987],[...],..]
+            
+            # Save input_tensor, embedding, and patch_scores to all_{counter}.npy file
+            np.savez(f'all_{self.save_counter}', input_tensor=input_tensor.cpu().numpy(), embedding=embedding.cpu().numpy(), patch_scores=patch_scores.cpu().numpy())
+            self.save_counter += 1  # カウンタをインクリメント
+            
             # reshape to batch dimension
             patch_scores = patch_scores.reshape((batch_size, -1))
             locations = locations.reshape((batch_size, -1))
@@ -102,7 +117,6 @@ class PatchcoreModel(DynamicBufferMixin, nn.Module):
             anomaly_map = self.anomaly_map_generator(patch_scores, output_size)
 
             output = {"anomaly_map": anomaly_map, "pred_score": pred_score}
-
         return output
 
     def generate_embedding(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -115,7 +129,10 @@ class PatchcoreModel(DynamicBufferMixin, nn.Module):
         Returns:
             Embedding vector
         """
+        print(f"features shape: {features[self.layers[0]].shape}")
         embeddings = features[self.layers[0]]
+        #embeddings shape: torch.Size([26, 512, 112, 112])
+        
         for layer in self.layers[1:]:
             layer_embedding = features[layer]
             layer_embedding = F.interpolate(layer_embedding, size=embeddings.shape[-2:], mode="bilinear")
